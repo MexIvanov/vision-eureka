@@ -54,6 +54,8 @@ import torch
 import time
 import numpy as np
 import pathlib
+import os
+import subprocess
 
 from PIL import Image
 from transformers import BitsAndBytesConfig, Qwen2VLForConditionalGeneration, AutoProcessor
@@ -238,17 +240,28 @@ def convert_files(files):
         path = pathlib.Path(f)
         extension = path.suffix
         
+        # Проверяем существование файла
+        if not path.exists():
+            print(f"Файл не найден: {f}")
+            continue
+
         if extension in [".docx", ".doc"]:
             new_path = path.with_suffix(".pdf")
             try:
-                docx_to_pdf(f, new_path)
+                # Конвертация DOCX -> PDF
+                docx_to_pdf(str(path), str(new_path))
                 f = new_path
-            except NotImplementedError:
-                convert_docx_to_pdf(f, "RAG")
-                f = join("./RAG", new_path)
+            except Exception as e:
+                print(f"Ошибка конвертации {f}: {e}")
+                continue
 
-        new_imgs = convert_from_path(f, dpi=200, thread_count=64)
-        images.extend(new_imgs)
+        # Конвертация PDF -> изображения
+        try:
+            new_imgs = convert_from_path(f, dpi=200, thread_count=4)
+            images.extend(new_imgs)
+        except Exception as e:
+            print(f"Ошибка обработки PDF {f}: {e}")
+            continue
         
         for img in new_imgs:
             img_id = get_uuid()
@@ -261,6 +274,7 @@ def convert_files(files):
     
     print("Сериализация метаданных успешно завершена.")
     return images, metadata
+
 
 def file_to_vdb(filepaths):
     """
