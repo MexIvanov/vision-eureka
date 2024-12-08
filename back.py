@@ -1,3 +1,53 @@
+"""
+Код для векторизации и поиска документов
+
+Данный код предназначен для обработки, векторизации и поиска данных в документах
+с использованием методов обработки естественного языка (NLP) и анализа изображений.
+Код интегрирован с Qdrant — системой поиска векторов, а также с моделью ColPali 
+для извлечения эмбеддингов из документов.
+
+Модули:
+    - `get_uuid`: Генерация уникального идентификатора для изображений.
+    - `upsert_to_qdrant`: Загрузка данных в Qdrant с механизмом повторных попыток.
+    - `convert_docx_to_pdf`: Конвертация файлов DOCX в PDF с использованием LibreOffice.
+    - `index_docs`: Индексация изображений в Qdrant пакетами.
+    - `query_vdb`: Поиск релевантных данных в Qdrant на основе эмбеддингов.
+    - `resize_image_to_resolution`: Изменение размера изображений с сохранением пропорций.
+    - `convert_files`: Конвертация документов (DOCX, PDF) в изображения для индексации.
+    - `file_to_vdb`: Индексация списка файлов в Qdrant.
+    - `reindex_doc_folder`: Полная переиндексация папки "RAG".
+    - `load_vlm`: Загрузка vision-language модели (Qwen2VL).
+    - `vlm_inference`: Проведение инференса с изображениями и текстовыми запросами с использованием Qwen2VL.
+
+Инициализация клиента Qdrant:
+    Клиент Qdrant настраивается для взаимодействия с базой данных.
+
+Информация о моделях:
+    - ColPali: Используется для обработки и создания эмбеддингов из изображений документов.
+    - Qwen2VL: Применяется для инференса на основе изображений и текста.
+
+Примеры использования:
+    - Для индексации файлов:
+        `file_to_vdb(["file1.docx", "file2.pdf"])`
+    - Для переиндексации папки:
+        `reindex_doc_folder()`
+    - Для поиска по базе:
+        `results = query_vdb("Ваш запрос")`
+    - Для инференса vision-language:
+        ```
+        model, processor = load_vlm()
+        output = vlm_inference(model, processor, ["path_to_image.png"], "Ваш запрос")
+        ```
+
+Зависимости:
+    - PyTorch
+    - Transformers
+    - PIL (Pillow)
+    - Qdrant Client
+    - Subprocess (для конвертации DOCX в PDF через LibreOffice)
+    - pdf2image (для конвертации PDF в изображения)
+"""
+
 import uuid
 import stamina
 import torch
@@ -8,24 +58,22 @@ import pathlib
 from PIL import Image
 from transformers import BitsAndBytesConfig, Qwen2VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
-from datasets import load_dataset
 from colpali_engine.models import ColPali, ColPaliProcessor
-
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
-
 from tqdm import tqdm
 from os import listdir
 from os.path import isfile, join
 from pdf2image import convert_from_path
 from docx2pdf import convert as docx_to_pdf
 
-
 COLLECTION_NAME = "documents_v2"
 
 def get_uuid():
+    """
+    Генерация уникального идентификатора.
+    """
     return str(uuid.uuid4())
-
 
 BNB_CONFIG = BitsAndBytesConfig(
     load_in_4bit=True,
@@ -33,15 +81,13 @@ BNB_CONFIG = BitsAndBytesConfig(
     bnb_4bit_compute_dtype=torch.bfloat16,
     bnb_4bit_use_double_quant=True,
 )
-# Initialize ColPali model and processor
-model_name = (
-    "vidore/colpali-v1.2" # Use the latest version available
-)
-# TODO: add check to load ColPali on demand
+
+# Инициализация модели ColPali и процессора
+model_name = "vidore/colpali-v1.2"
 colpali_model = ColPali.from_pretrained(
     model_name,
     torch_dtype=torch.bfloat16,
-    device_map="cuda:0",  # Use "cuda:0" for GPU, "cpu" for CPU, or "mps" for Apple Silicon
+    device_map="cuda:0",
     quantization_config=BNB_CONFIG,
 )
 colpali_processor = ColPaliProcessor.from_pretrained(
@@ -49,33 +95,34 @@ colpali_processor = ColPaliProcessor.from_pretrained(
     quantization_config=BNB_CONFIG,
 )
 
-qdrant_client = QdrantClient(url="http://localhost:6333") #TODO: change later
+qdrant_client = QdrantClient(url="http://localhost:6333")
 
-
-
+# Проверка существования коллекции и её создание, если она отсутствует
 exists = qdrant_client.collection_exists(COLLECTION_NAME)
 if not exists:
     qdrant_client.create_collection(
         collection_name=COLLECTION_NAME,
-        on_disk_payload=True,  # store the payload on disk
+        on_disk_payload=True,
         vectors_config=models.VectorParams(
             size=128,
             distance=models.Distance.COSINE,
-            on_disk=True, # move original vectors to disk
+            on_disk=True,
             multivector_config=models.MultiVectorConfig(
                 comparator=models.MultiVectorComparator.MAX_SIM
             ),
             quantization_config=models.BinaryQuantization(
-            binary=models.BinaryQuantizationConfig(
-                always_ram=True  # keep only quantized vectors in RAM
+                binary=models.BinaryQuantizationConfig(
+                    always_ram=True
                 ),
             ),
         ),
     )
-   
-    
-@stamina.retry(on=Exception, attempts=5) # retry mechanism if an exception occurs during the operation
+
+@stamina.retry(on=Exception, attempts=5)
 def upsert_to_qdrant(points):
+    """
+    Загрузка данных в Qdrant с повторными попытками в случае ошибки.
+    """
     try:
         qdrant_client.upsert(
             collection_name=COLLECTION_NAME,
@@ -83,21 +130,13 @@ def upsert_to_qdrant(points):
             wait=False,
         )
     except Exception as e:
-        print(f"Error during upsert: {e}")
+        print(f"Ошибка при загрузке данных: {e}")
         return False
     return True
 
-
-import subprocess
-import os
-
 def convert_docx_to_pdf(docx_file, output_dir=None):
     """
-    Конвертирует файл DOCX в PDF с использованием LibreOffice.
-
-    :param docx_file: Путь к файлу DOCX.
-    :param output_dir: Путь к директории, куда сохранить PDF. Если None, сохраняется в ту же директорию.
-    :return: Путь к созданному PDF.
+    Конвертирует DOCX файл в PDF с использованием LibreOffice.
     """
     if not os.path.isfile(docx_file):
         raise FileNotFoundError(f"Файл {docx_file} не найден.")
@@ -118,62 +157,47 @@ def convert_docx_to_pdf(docx_file, output_dir=None):
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Ошибка при конвертации: {e.stderr.decode('utf-8')}") from e
 
-def index_docs(images, metadata, batch_size=4): # Adjust batch_size based on your GPU memory constraints
-    # Use tqdm to create a progress bar
-    with tqdm(total=len(images), desc="Indexing Progress") as pbar:
+def index_docs(images, metadata, batch_size=4):
+    """
+    Индексация изображений и метаданных в Qdrant пакетами.
+    """
+    with tqdm(total=len(images), desc="Индексация прогресс") as pbar:
         for i in range(0, len(images), batch_size):
-            batch = images[i : i + batch_size] # The images are PIL Image objects, so we can use them directly
-            metadata_batch = metadata[i : i + batch_size]
+            batch = images[i:i + batch_size]
+            metadata_batch = metadata[i:i + batch_size]
             
-            # Process and encode images
             with torch.no_grad():
-                batch_images = colpali_processor.process_images(batch).to(
-                    colpali_model.device
-                )
+                batch_images = colpali_processor.process_images(batch).to(colpali_model.device)
                 image_embeddings = colpali_model(**batch_images)
 
-            # Prepare points for Qdrant
             points = []
             for image, mdata, embedding in zip(batch, metadata_batch, image_embeddings):
-                # Convert the embedding to a list of vectors
                 multivector = embedding.cpu().float().numpy().tolist()
-
                 points.append(
                     models.PointStruct(
-                        id=mdata["img_id"],  # we just use the index as the ID
-                        vector=multivector,  # This is now a list of vectors
-                        payload={
-                            "source": mdata["source"],
-                        },  # can also add other metadata/data
+                        id=mdata["img_id"],
+                        vector=multivector,
+                        payload={"source": mdata["source"]},
                     )
                 )
 
-            # Upload points to Qdrant
-            try:
-                upsert_to_qdrant(points)
-            except Exception as e:
-                print(f"Error during upsert: {e}")
-                continue
-
-            # Update the progress bar
+            upsert_to_qdrant(points)
             pbar.update(batch_size)
 
     qdrant_client.update_collection(
         collection_name=COLLECTION_NAME,
         optimizer_config=models.OptimizersConfigDiff(indexing_threshold=10),
-
     )
-    print("Indexing complete!")
-
+    print("Индексация завершена!")
 
 def query_vdb(query_text):
+    """
+    Выполняет запрос в Qdrant для поиска наиболее релевантных данных на основе эмбеддингов.
+    """
     with torch.no_grad():
-        batch_query = colpali_processor.process_queries([query_text]).to(
-            colpali_model.device
-        )
+        batch_query = colpali_processor.process_queries([query_text]).to(colpali_model.device)
         query_embedding = colpali_model(**batch_query)
 
-    #print(query_embedding)
     multivector_query = query_embedding[0].cpu().float().numpy().tolist()
 
     start_time = time.time()
@@ -191,132 +215,97 @@ def query_vdb(query_text):
         )
     )
     end_time = time.time()
-    # Search in Qdrant
-    print(search_result.points)
 
-    elapsed_time = end_time - start_time
-    print(f"Search completed in {elapsed_time:.4f} seconds")
+    print(f"Запрос выполнен за {end_time - start_time:.4f} секунд")
     return search_result.points
 
 def resize_image_to_resolution(img, resolution):
-    # Open the image
-
-    # Calculate the current aspect ratio
+    """
+    Изменяет размер изображения до заданного разрешения с сохранением пропорций.
+    """
     aspect_ratio = img.width / img.height
-    
-    # Determine the new dimensions
     new_width = resolution
     new_height = int(resolution / aspect_ratio)
-
-    # Resize the image
     return img.resize((new_width, new_height))
 
-
 def convert_files(files):
+    """
+    Конвертирует файлы DOCX и PDF в изображения, сохраняет метаданные.
+    """
     images = []
     metadata = []
-    for f in tqdm(files):
+    for f in tqdm(files, desc="Обработка файлов"):
         path = pathlib.Path(f)
         extension = path.suffix
-        print(extension)
         
         if extension in [".docx", ".doc"]:
             new_path = path.with_suffix(".pdf")
-            print(new_path)
             try:
                 docx_to_pdf(f, new_path)
                 f = new_path
             except NotImplementedError:
                 convert_docx_to_pdf(f, "RAG")
                 f = join("./RAG", new_path)
-                pass
-
-            
 
         new_imgs = convert_from_path(f, dpi=200, thread_count=64)
         images.extend(new_imgs)
         
         for img in new_imgs:
             img_id = get_uuid()
-            img_path = (f"imgs/{img_id}.png")
-
-            #img = resize_image_to_resolution(img, 1280)
+            img_path = f"imgs/{img_id}.png"
             img.save(img_path)
             metadata.append({"img_id": img_id, "source": f.split("/")[-1]})
 
-
-    if (len(images) != len(metadata)):
-        return print("Metadata serialization error!")
-    else:
-        print("Metadata serialization ok!")
+    if len(images) != len(metadata):
+        raise ValueError("Ошибка сериализации метаданных!")
     
+    print("Сериализация метаданных успешно завершена.")
     return images, metadata
 
-
-def file_to_vdb(filepaths: list):
-    print("Converting files")
+def file_to_vdb(filepaths):
+    """
+    Конвертирует и индексирует список файлов в базу данных Qdrant.
+    """
+    print("Начало конвертации файлов")
     images, metadata = convert_files(filepaths)
     index_docs(images, metadata, batch_size=10)
 
 def reindex_doc_folder():
+    """
+    Полная переиндексация папки "RAG".
+    """
     onlyfiles = [f for f in listdir("RAG") if isfile(join("RAG", f))]
-    onlyfiles2 = []
-    #onlyfiles = [onlyfiles[0]] #TODO:REMOVE
-    for i in onlyfiles:
-        fpath = "./RAG/" + i
-        onlyfiles2.append(fpath)
-        #if isfile(fpath):
-        #    print(fpath)
-    print(onlyfiles2)
-    file_to_vdb(onlyfiles2)
-
+    onlyfiles_paths = [f"./RAG/{file}" for file in onlyfiles]
+    file_to_vdb(onlyfiles_paths)
 
 def load_vlm():
-    # model = Qwen2VLForConditionalGeneration.from_pretrained(
-    # "Qwen/Qwen2-VL-7B-Instruct", torch_dtype="auto", device_map="auto"
-    # )
-
-    #We recommend enabling flash_attention_2 for better acceleration and memory saving, especially in multi-image and video scenarios.
-
-
+    """
+    Загружает модель Qwen2VL и процессор.
+    """
     model = Qwen2VLForConditionalGeneration.from_pretrained(
         "Qwen/Qwen2-VL-7B-Instruct",
-        #attn_implementation="flash_attention_2", #doesn't work on zerogpu WTF?!
         trust_remote_code=True,
-        #quantization_config=BNB_CONFIG, 
         torch_dtype=torch.bfloat16,
-	device_map="auto") #.(to_cuda:0")
-
-    # default processer
-    min_pixels = 256*28*28
-    max_pixels = 1280*28*28
-    #processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-2B-Instruct", min_pixels=min_pixels, max_pixels=max_pixels)
-    processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct", min_pixels=min_pixels, max_pixels=max_pixels) #, quantization_config=BNB_CONFIG)
+        device_map="auto"
+    )
+    min_pixels = 256 * 28 * 28
+    max_pixels = 1280 * 28 * 28
+    processor = AutoProcessor.from_pretrained(
+        "Qwen/Qwen2-VL-7B-Instruct", 
+        min_pixels=min_pixels, 
+        max_pixels=max_pixels
+    )
     return model, processor
 
 def vlm_inference(model, processor, images, text):
-   
+    """
+    Выполняет инференс на изображениях и текстовом запросе с использованием Qwen2VL.
+    """
     img_list = [{"type": "image", "image": Image.open(image)} for image in images]
     img_list.append({"type": "text", "text": text})
-    
-    #messages = []
-    #content = []
-    #for img in images: 
-    #    content.append({'image': Image.open(img)})
-    
-    #content.append({'text': text})
-    #messages.append({'role': 'user', 'content': content})
-    #messages.append({'role': 'assistant', 'content': [{'text': a}]})
-    #content = []
 
-    messages = [
-        {
-            "role": "user",
-            "content": img_list,
-        }
-    ]
+    messages = [{"role": "user", "content": img_list}]
 
-    # Preparation for inference
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
@@ -327,39 +316,15 @@ def vlm_inference(model, processor, images, text):
         videos=video_inputs,
         padding=True,
         return_tensors="pt",
-    )
-    inputs = inputs.to("cuda")
+    ).to("cuda")
 
-    # Inference: Generation of the output
-    generated_ids = model.generate(**inputs, max_new_tokens=128)#, repetition_penalty=1.5 )
+    generated_ids = model.generate(**inputs, max_new_tokens=512)
     generated_ids_trimmed = [
-        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
     ]
     output_text = processor.batch_decode(
         generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )
-    del model
-    del processor
+    del model, processor
     torch.cuda.empty_cache()
     return output_text[0]
-
-#print(str(results[0].id))
-#breakpoint()
-
-"""
-reindex_doc_folder() - fully reindex RAG folder
-file_to_vdb(filepaths) - index list of files
-query_vdb("query") - get relevant image metadata from qdrant vdb
-"""
-#file_to_vdb(["СП_496_1325800_2020_Основания_и_фундаменты_зданий_и_сооружений.docx", "2022_Annual_Report_of_PJSC_MMC_Norilsk_Nickel_rus.pdf"])
-#reindex_doc_folder()
-
-"""
-PROMPT = "What are the key findings of Global Metals and Mining Outlook"
-results = query_vdb(PROMPT)
-model, processor = load_vlm()
-
-for idx, res in enumerate(results):
-    img = f"imgs/{str(res.id)}.png"
-    print(idx, ") | ", str(res.id), " | ", vlm_inference(model, processor, [img], PROMPT))
-"""
