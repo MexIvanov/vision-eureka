@@ -126,7 +126,7 @@ with gr.Blocks(css=".block-title {text-align: center; font-size: 24px; font-weig
     with gr.Tab("📤 Загрузка файлов для индексации"):
         gr.Markdown("### Загрузите документы для обновления базы данных")
         with gr.Row():
-            files = gr.Files(label="Загрузите файлы", file_types=[".docx", ".pdf"])
+            files = gr.Files(label="Загрузите файлы", file_types=[".pdf"])
             index_button = gr.Button("Добавить файлы", variant="secondary")
             status_output = gr.Textbox(label="Статус", interactive=False, lines=3)  
         index_button.click(index_files_ui, inputs=[files], outputs=[status_output])
